@@ -22,6 +22,8 @@ import urllib3
 import warnings
 import urllib.parse
 import subprocess
+import zipfile
+import shutil
 
 # Suppress SSL warnings
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -680,73 +682,109 @@ def validate_file_size(file_path, size_mb):
     # Default: OK
     return "OK"
 
-def analyze_local_commits(repo_path, start_date=None, end_date=None, file_patterns=None, output_excel="local_commit_report.xlsx"):
+def suggest_optimization(file_path, size_mb):
+    ext = file_path.lower()
+    if ext.endswith(('.png', '.jpg', '.jpeg')):
+        return "Kompres ke WebP, turunkan resolusi/quality"
+    if ext.endswith('.webp'):
+        return "Pastikan sudah lossy, cek resolusi"
+    if ext.endswith(('.ogg', '.aac', '.mp3')):
+        return "Turunkan bitrate, kompres audio"
+    if ext.endswith('.mp4'):
+        return "Turunkan resolusi/bitrate video"
+    if ext.endswith(('.json', '.xml')):
+        return "Pertimbangkan compress GZIP atau split"
+    if ext.endswith(('.ttf', '.otf')):
+        return "Pisahkan font ke modul terpisah"
+    if ext.endswith(('.so', '.dex', '.aar', '.apk', '.jar')):
+        return "File binary besar, audit manual kebutuhan file"
+    return "Audit manual, cek kebutuhan file"
+
+RELEVANT_FOLDERS = [
+    'res', 'assets', 'jniLibs', 'lib', 'raw', 'fonts'
+]
+RELEVANT_EXTS = [
+    '.png', '.jpg', '.jpeg', '.webp', '.xml', '.json', '.mp3', '.ogg', '.aac', '.ttf', '.otf', '.so', '.dex', '.aar', '.jar', '.apk', '.mp4'
+]
+
+def is_relevant_file(file_path):
+    parts = file_path.split(os.sep)
+    if not any(folder in parts for folder in RELEVANT_FOLDERS):
+        return False
+    if not any(file_path.lower().endswith(ext) for ext in RELEVANT_EXTS):
+        return False
+    return True
+
+def analyze_local_snapshot(repo_path, output_excel="local_snapshot_report.xlsx", file_types=None):
+    import os
+    import pandas as pd
+    from tqdm import tqdm
+    file_list = []
+    for root, dirs, files in os.walk(repo_path):
+        if '.git' in root:
+            continue
+        for file in files:
+            file_list.append(os.path.join(root, file))
+    data = []
+    for file_path in tqdm(file_list, desc="Snapshot HEAD", unit="file"):
+        rel_path = os.path.relpath(file_path, repo_path)
+        if not is_relevant_file(rel_path):
+            continue
+        # Filter by file_types if provided
+        if file_types:
+            if not any(rel_path.lower().endswith('.' + ext.strip().lower()) for ext in file_types):
+                continue
+        try:
+            size_mb = round(os.path.getsize(file_path) / 1024 / 1024, 2)
+        except Exception:
+            size_mb = None
+        data.append({
+            "File": rel_path,
+            "File Size (MB)": size_mb,
+            "NonStandard": is_non_standard(file_path),
+            "Validation": validate_file_size(file_path, size_mb)
+        })
+    df = pd.DataFrame(data)
+    if not df.empty:
+        df = df.sort_values(["File Size (MB)"], ascending=[False])
+    # Sheet Optimization Candidates
+    if not df.empty:
+        opt_df = df[(df["Validation"] == "OVERSIZE") & (~df["File"].str.lower().str.endswith(tuple([".so", ".dex", ".aar", ".apk", ".jar"])))].copy()
+        if not opt_df.empty:
+            opt_df["Saran Optimasi"] = opt_df.apply(lambda row: suggest_optimization(row["File"], row["File Size (MB)"]), axis=1)
+        else:
+            opt_df = pd.DataFrame()
+    else:
+        opt_df = pd.DataFrame()
+    return df, opt_df
+
+def analyze_local_all_commits(repo_path, file_patterns=None):
     import subprocess
     import pandas as pd
     import re
-    from datetime import datetime
     from tqdm import tqdm
-    
-    # Aturan validasi untuk sheet dokumentasi
-    validation_rules = [
-        ["Kategori", "Ekstensi/Format", "Batas Maksimal (MB)", "Catatan"],
-        ["Icon/Ilustrasi Sederhana", "XML (Vector)", "0.02", "< 20 KB"],
-        ["Icon/Ilustrasi Sederhana", "PNG/JPG", "0.05", "≤ 50 KB"],
-        ["Gambar Konten", "WebP", "0.2", "≤ 200 KB"],
-        ["Gambar Fullscreen", "WebP/JPG", "0.5", "≤ 500 KB (1080x1920)"],
-        ["Audio Efek", "OGG/AAC", "0.1", "< 100 KB (<5s)"],
-        ["Audio Musik Pendek", "OGG/AAC", "0.3", "≤ 300 KB"],
-        ["Video Pendek", "MP4/MOV/M4V", "1", "< 1 MB (480p)"],
-        ["Lottie Animation", "JSON", "0.2", "50–200 KB"],
-        ["Native Library", ".so", "5", "≤ 5 MB per ABI"],
-        ["DEX/Kode", ".dex", "10", "≤ 10 MB per file"],
-        ["JSON/Data Bundling", ".json", "0.1", "≤ 100 KB"],
-        ["Font", ".ttf/.otf", "0.5", "≤ 500 KB"],
-        ["Resource XML", ".xml", "0.02", "< 20 KB"],
-    ]
-
-    # Info analisis
-    def get_current_branch(repo_path):
-        import subprocess
-        result = subprocess.run(
-            ["git", "-C", repo_path, "rev-parse", "--abbrev-ref", "HEAD"],
-            capture_output=True, text=True
-        )
-        return result.stdout.strip()
-    branch_name = get_current_branch(repo_path)
-    info_data = [
-        ["Branch", branch_name],
-        ["Start Date", start_date if start_date else "(tidak dispesifikasikan)"],
-        ["End Date", end_date if end_date else "(tidak dispesifikasikan)"],
-    ]
-    
-    # Get list of commits in date range
+    # Get all commits (not just linear)
     log_cmd = [
-        "git", "-C", repo_path, "log", "--pretty=format:%H|%ad|%s", "--date=short"
+        "git", "-C", repo_path, "rev-list", "--all"
     ]
-    if start_date:
-        log_cmd.append(f"--since={start_date}")
-    if end_date:
-        log_cmd.append(f"--until={end_date}")
-    commits = []
     result = subprocess.run(log_cmd, capture_output=True, text=True)
-    for line in result.stdout.strip().splitlines():
-        if '|' in line:
-            parts = line.split('|', 2)
-            if len(parts) == 3:
-                sha, date, title = parts
-                commits.append((sha.strip(), date.strip(), title.strip()))
-            else:
-                sha, date = parts[0], parts[1]
-                commits.append((sha.strip(), date.strip(), ""))
-    
-    print(f"\n🔍 Found {len(commits)} commits in range.")
-    
+    commits = result.stdout.strip().splitlines()
+    # Get commit info (date, title)
+    commit_info = {}
+    for sha in commits:
+        info_cmd = [
+            "git", "-C", repo_path, "show", "-s", "--format=%ad|%s", "--date=short", sha
+        ]
+        info_result = subprocess.run(info_cmd, capture_output=True, text=True)
+        if '|' in info_result.stdout:
+            date, title = info_result.stdout.strip().split('|', 1)
+        else:
+            date, title = '', ''
+        commit_info[sha] = (date, title)
     data = []
-    for sha, date, title in tqdm(commits, desc="Processing commits", unit="commit"):
-        # Get changed files in this commit
+    for sha in tqdm(commits, desc="Processing all commits", unit="commit"):
         diff_cmd = [
-            "git", "-C", repo_path, "diff-tree", "--no-commit-id", "--name-only", "-r", sha
+            "git", "-C", repo_path, "diff-tree", "--no-commit-id", "--name-only", "-r", "-m", "--root", sha
         ]
         diff_result = subprocess.run(diff_cmd, capture_output=True, text=True)
         files = diff_result.stdout.strip().splitlines()
@@ -756,6 +794,7 @@ def analyze_local_commits(repo_path, start_date=None, end_date=None, file_patter
             size_kb = get_file_size_in_commit(repo_path, sha, file_path)
             size_mb = round(size_kb / 1024, 2) if size_kb is not None else None
             validation = validate_file_size(file_path, size_mb)
+            date, title = commit_info.get(sha, ('', ''))
             data.append({
                 "Commit": sha[:8],
                 "Date": date,
@@ -768,56 +807,7 @@ def analyze_local_commits(repo_path, start_date=None, end_date=None, file_patter
     df = pd.DataFrame(data)
     if not df.empty:
         df = df.sort_values(["File Size (MB)"], ascending=[False])
-    # Tulis ke Excel dengan sheet info di tab pertama, lalu report, lalu aturan validasi
-    with pd.ExcelWriter(output_excel, engine='openpyxl') as writer:
-        # Sheet info analisis
-        pd.DataFrame(info_data, columns=["Info", "Value"]).to_excel(writer, sheet_name='Info', index=False)
-        # Sheet utama
-        df.to_excel(writer, sheet_name='File Report', index=False)
-        # Sheet aturan validasi
-        pd.DataFrame(validation_rules[1:], columns=validation_rules[0]).to_excel(writer, sheet_name='Validation Rules', index=False)
-    # Conditional formatting: warna merah untuk OVERSIZE
-    try:
-        from openpyxl.styles import PatternFill
-        from openpyxl import load_workbook
-        wb = load_workbook(output_excel)
-        ws = wb['File Report']
-        val_col = None
-        for idx, cell in enumerate(ws[1], 1):
-            if cell.value == "Validation":
-                val_col = idx
-                break
-        if val_col:
-            red_fill = PatternFill(start_color="FF0000", end_color="FF0000", fill_type="solid")
-            for row in ws.iter_rows(min_row=2, min_col=val_col, max_col=val_col):
-                for cell in row:
-                    if cell.value == "OVERSIZE":
-                        cell.fill = red_fill
-            wb.save(output_excel)
-    except Exception as e:
-        print(f"Warning: Conditional formatting failed: {e}")
-    print(f"\n✅ Local commit file size report saved to {output_excel}")
     return df
-
-def has_uncommitted_changes(repo_path):
-    import subprocess
-    result = subprocess.run(
-        ["git", "-C", repo_path, "status", "--porcelain"],
-        capture_output=True, text=True
-    )
-    return bool(result.stdout.strip())
-
-def checkout_branch(repo_path, branch_name):
-    import subprocess
-    result = subprocess.run(
-        ["git", "-C", repo_path, "checkout", branch_name],
-        capture_output=True, text=True
-    )
-    if result.returncode != 0:
-        print(f"❌ Gagal checkout ke branch {branch_name}: {result.stderr}")
-        return False
-    print(f"✅ Berhasil checkout ke branch {branch_name}")
-    return True
 
 def get_current_branch(repo_path):
     import subprocess
@@ -850,16 +840,21 @@ def parse_args():
     parser.add_argument('--analyze-local-commits', action='store_true', help='Analyze file sizes per commit from local repo (no checkout)')
     parser.add_argument('--local-path', default='.', help='Path to local git project (default: current directory)')
     parser.add_argument('--local-branch', help='Nama branch lokal yang ingin di-checkout sebelum analisis')
+    parser.add_argument('--analyze-local-snapshot', action='store_true', help='Analyze all files in HEAD (snapshot)')
+    parser.add_argument('--analyze-local-all-commits', action='store_true', help='Analyze all commits in local repo (not just linear)')
+    parser.add_argument('--analyze-apk', action='store_true', help='Analyze APK/AAB file content')
+    parser.add_argument('--apk-path', help='Path to APK/AAB file to analyze')
+    parser.add_argument('--snapshot-file-types', help='Filter file types (comma separated, e.g. png,jpg,webp) for snapshot HEAD')
     args = parser.parse_args()
 
-    # Validasi: jika TIDAK analyze-local-commits, argumen GitLab wajib
-    if not args.analyze_local_commits:
+    # Validasi: jika TIDAK mode analisis lokal atau analyze-apk, argumen GitLab wajib
+    if not (args.analyze_local_commits or args.analyze_local_snapshot or args.analyze_local_all_commits or args.analyze_apk):
         if not args.gitlab_url or not args.token or not args.project_id:
-            parser.error("--gitlab-url, --token, dan --project-id wajib diisi kecuali menggunakan --analyze-local-commits")
+            parser.error("--gitlab-url, --token, dan --project-id wajib diisi kecuali menggunakan mode analisis lokal atau --analyze-apk")
 
     # Validasi argument
-    if not args.analyze_branch and not args.target_branch and not args.analyze_local_commits:
-        parser.error("Either --target-branch, --analyze-branch, atau --analyze-local-commits must be specified")
+    if not args.analyze_branch and not args.target_branch and not (args.analyze_local_commits or args.analyze_local_snapshot or args.analyze_local_all_commits or args.analyze_apk):
+        parser.error("Either --target-branch, --analyze-branch, atau salah satu mode analisis lokal/--analyze-apk harus diisi")
 
     # Validasi format tanggal
     if args.start_date:
@@ -877,6 +872,65 @@ def parse_args():
 def main():
     try:
         args = parse_args()
+        # Analisis APK/AAB
+        if getattr(args, 'analyze_apk', False):
+            if not args.apk_path:
+                print("❌ Harap isi --apk-path untuk analisis APK/AAB!")
+                return
+            project_root = args.local_path if hasattr(args, 'local_path') else None
+            apk_df, mapping_df = analyze_apk_aab(args.apk_path, project_root)
+            with pd.ExcelWriter(args.output_excel, engine='openpyxl') as writer:
+                apk_df.to_excel(writer, sheet_name='APK_AAB_Content', index=False)
+                if mapping_df is not None and not mapping_df.empty:
+                    mapping_df.to_excel(writer, sheet_name='APK_to_Project_Mapping', index=False)
+            print(f"\n✅ APK/AAB content report saved to {args.output_excel}")
+            return
+        # Hybrid mode: snapshot HEAD dan/atau all commits
+        if getattr(args, 'analyze_local_snapshot', False) or getattr(args, 'analyze_local_all_commits', False):
+            info_data = []
+            from datetime import datetime
+            info_data.append(["Generated At", datetime.now().strftime("%Y-%m-%d %H:%M:%S")])
+            info_data.append(["Repo Path", args.local_path])
+            info_data.append(["Branch", get_current_branch(args.local_path)])
+            if getattr(args, 'analyze_local_snapshot', False):
+                info_data.append(["Snapshot HEAD", "Yes"])
+            if getattr(args, 'analyze_local_all_commits', False):
+                info_data.append(["All Commits", "Yes"])
+            info_data.append(["Start Date", args.start_date if args.start_date else "(tidak dispesifikasikan)"])
+            info_data.append(["End Date", args.end_date if args.end_date else "(tidak dispesifikasikan)"])
+            file_types = args.snapshot_file_types.split(',') if getattr(args, 'snapshot_file_types', None) else None
+            # Sheet: Snapshot HEAD
+            snapshot_df, opt_df = analyze_local_snapshot(args.local_path, file_types=file_types) if getattr(args, 'analyze_local_snapshot', False) else (None, None)
+            # Sheet: All Commits
+            all_commits_df = analyze_local_all_commits(args.local_path, args.file_patterns.split(',') if args.file_patterns else None) if getattr(args, 'analyze_local_all_commits', False) else None
+            # Sheet: Validation Rules
+            validation_rules = [
+                ["Kategori", "Ekstensi/Format", "Batas Maksimal (MB)", "Catatan"],
+                ["Icon/Ilustrasi Sederhana", "XML (Vector)", "0.02", "< 20 KB"],
+                ["Icon/Ilustrasi Sederhana", "PNG/JPG", "0.05", "≤ 50 KB"],
+                ["Gambar Konten", "WebP", "0.2", "≤ 200 KB"],
+                ["Gambar Fullscreen", "WebP/JPG", "0.5", "≤ 500 KB (1080x1920)"],
+                ["Audio Efek", "OGG/AAC", "0.1", "< 100 KB (<5s)"],
+                ["Audio Musik Pendek", "OGG/AAC", "0.3", "≤ 300 KB"],
+                ["Video Pendek", "MP4/MOV/M4V", "1", "< 1 MB (480p)"],
+                ["Lottie Animation", "JSON", "0.2", "50–200 KB"],
+                ["Native Library", ".so", "5", "≤ 5 MB per ABI"],
+                ["DEX/Kode", ".dex", "10", "≤ 10 MB per file"],
+                ["JSON/Data Bundling", ".json", "0.1", "≤ 100 KB"],
+                ["Font", ".ttf/.otf", "0.5", "≤ 500 KB"],
+                ["Resource XML", ".xml", "0.02", "< 20 KB"],
+            ]
+            with pd.ExcelWriter(args.output_excel, engine='openpyxl') as writer:
+                pd.DataFrame(info_data, columns=["Info", "Value"]).to_excel(writer, sheet_name='Info', index=False)
+                if snapshot_df is not None:
+                    snapshot_df.to_excel(writer, sheet_name='Snapshot HEAD', index=False)
+                if opt_df is not None and not opt_df.empty:
+                    opt_df.to_excel(writer, sheet_name='Optimization Candidates', index=False)
+                if all_commits_df is not None:
+                    all_commits_df.to_excel(writer, sheet_name='All Commits', index=False)
+                pd.DataFrame(validation_rules[1:], columns=validation_rules[0]).to_excel(writer, sheet_name='Validation Rules', index=False)
+            print(f"\n✅ Hybrid report saved to {args.output_excel}")
+            return
         # Jalankan analisis lokal dulu, jika dipilih
         if getattr(args, 'analyze_local_commits', False):
             # Jika user ingin checkout branch tertentu
@@ -1034,6 +1088,192 @@ def main():
     except Exception as e:
         print(f"\n{Fore.RED}❌ Error: {str(e)}{Style.RESET_ALL}")
         sys.exit(1)
+
+def analyze_local_commits(repo_path, start_date=None, end_date=None, file_patterns=None, output_excel="local_commit_report.xlsx"):
+    import subprocess
+    import pandas as pd
+    import re
+    from datetime import datetime
+    from tqdm import tqdm
+    # Get list of commits in date range
+    log_cmd = [
+        "git", "-C", repo_path, "log", "--pretty=format:%H|%ad|%s", "--date=short"
+    ]
+    if start_date:
+        log_cmd.append(f"--since={start_date}")
+    if end_date:
+        log_cmd.append(f"--until={end_date}")
+    commits = []
+    result = subprocess.run(log_cmd, capture_output=True, text=True)
+    for line in result.stdout.strip().splitlines():
+        if '|' in line:
+            parts = line.split('|', 2)
+            if len(parts) == 3:
+                sha, date, title = parts
+                commits.append((sha.strip(), date.strip(), title.strip()))
+            else:
+                sha, date = parts[0], parts[1]
+                commits.append((sha.strip(), date.strip(), ""))
+    print(f"\n🔍 Found {len(commits)} commits in range.")
+    data = []
+    for sha, date, title in tqdm(commits, desc="Processing commits", unit="commit"):
+        diff_cmd = [
+            "git", "-C", repo_path, "diff-tree", "--no-commit-id", "--name-only", "-r", "-m", "--root", sha
+        ]
+        diff_result = subprocess.run(diff_cmd, capture_output=True, text=True)
+        files = diff_result.stdout.strip().splitlines()
+        for file_path in files:
+            if file_patterns and not any(re.search(p, file_path) for p in file_patterns):
+                continue
+            size_kb = get_file_size_in_commit(repo_path, sha, file_path)
+            size_mb = round(size_kb / 1024, 2) if size_kb is not None else None
+            validation = validate_file_size(file_path, size_mb)
+            data.append({
+                "Commit": sha[:8],
+                "Date": date,
+                "Commit Title": title,
+                "File": file_path,
+                "File Size (MB)": size_mb,
+                "NonStandard": is_non_standard(file_path),
+                "Validation": validation
+            })
+    df = pd.DataFrame(data)
+    if not df.empty:
+        df = df.sort_values(["File Size (MB)"], ascending=[False])
+    # Grouping by File
+    if not df.empty:
+        grouped = df.groupby("File").agg({
+            "File Size (MB)": "max",
+            "Commit": "count",
+            "Date": "max",
+            "Validation": lambda x: "OVERSIZE" if (x == "OVERSIZE").any() else "OK",
+            "Commit Title": "last",
+            "NonStandard": "first"
+        }).reset_index()
+        grouped = grouped.rename(columns={
+            "Commit": "Change Count",
+            "Date": "Last Change Date"
+        })
+    else:
+        grouped = pd.DataFrame()
+    # Summary info
+    total_size = df["File Size (MB)"].sum() if not df.empty else 0
+    total_files = len(df)
+    total_oversize = (df["Validation"] == "OVERSIZE").sum() if not df.empty else 0
+    biggest_file = df.iloc[0] if not df.empty else None
+    info_data = [
+        ["Branch", get_current_branch(repo_path)],
+        ["Start Date", start_date if start_date else "(tidak dispesifikasikan)"],
+        ["End Date", end_date if end_date else "(tidak dispesifikasikan)"],
+        ["Total File Size (MB)", round(total_size, 2)],
+        ["Total Files Analyzed", total_files],
+        ["Total OVERSIZE Files", total_oversize],
+    ]
+    if biggest_file is not None:
+        info_data += [
+            ["Biggest File", biggest_file["File"]],
+            ["Biggest File Size (MB)", biggest_file["File Size (MB)"]],
+        ]
+    # Tulis ke Excel dengan sheet info di tab pertama, lalu report, lalu aturan validasi
+    validation_rules = [
+        ["Kategori", "Ekstensi/Format", "Batas Maksimal (MB)", "Catatan"],
+        ["Icon/Ilustrasi Sederhana", "XML (Vector)", "0.02", "< 20 KB"],
+        ["Icon/Ilustrasi Sederhana", "PNG/JPG", "0.05", "≤ 50 KB"],
+        ["Gambar Konten", "WebP", "0.2", "≤ 200 KB"],
+        ["Gambar Fullscreen", "WebP/JPG", "0.5", "≤ 500 KB (1080x1920)"],
+        ["Audio Efek", "OGG/AAC", "0.1", "< 100 KB (<5s)"],
+        ["Audio Musik Pendek", "OGG/AAC", "0.3", "≤ 300 KB"],
+        ["Video Pendek", "MP4/MOV/M4V", "1", "< 1 MB (480p)"],
+        ["Lottie Animation", "JSON", "0.2", "50–200 KB"],
+        ["Native Library", ".so", "5", "≤ 5 MB per ABI"],
+        ["DEX/Kode", ".dex", "10", "≤ 10 MB per file"],
+        ["JSON/Data Bundling", ".json", "0.1", "≤ 100 KB"],
+        ["Font", ".ttf/.otf", "0.5", "≤ 500 KB"],
+        ["Resource XML", ".xml", "0.02", "< 20 KB"],
+    ]
+    with pd.ExcelWriter(output_excel, engine='openpyxl') as writer:
+        pd.DataFrame(info_data, columns=["Info", "Value"]).to_excel(writer, sheet_name='Info', index=False)
+        df.to_excel(writer, sheet_name='File Report', index=False)
+        grouped.to_excel(writer, sheet_name='Grouped Files', index=False)
+        pd.DataFrame(validation_rules[1:], columns=validation_rules[0]).to_excel(writer, sheet_name='Validation Rules', index=False)
+    # Conditional formatting: warna merah untuk OVERSIZE
+    try:
+        from openpyxl.styles import PatternFill
+        from openpyxl import load_workbook
+        wb = load_workbook(output_excel)
+        ws = wb['File Report']
+        val_col = None
+        for idx, cell in enumerate(ws[1], 1):
+            if cell.value == "Validation":
+                val_col = idx
+                break
+        if val_col:
+            red_fill = PatternFill(start_color="FF0000", end_color="FF0000", fill_type="solid")
+            for row in ws.iter_rows(min_row=2, min_col=val_col, max_col=val_col):
+                for cell in row:
+                    if cell.value == "OVERSIZE":
+                        cell.fill = red_fill
+            wb.save(output_excel)
+    except Exception as e:
+        print(f"Warning: Conditional formatting failed: {e}")
+    print(f"\n✅ Local commit file size report saved to {output_excel}")
+    return df
+
+def map_apk_to_project(apk_files, project_root):
+    import os
+    project_files = []
+    for root, dirs, files in os.walk(project_root):
+        for file in files:
+            project_files.append(os.path.relpath(os.path.join(root, file), project_root))
+    mapping = []
+    for apk_file, size_mb, saran in apk_files:
+        matches = [f for f in project_files if os.path.basename(f) == os.path.basename(apk_file)]
+        mapping.append({
+            'File in APK': apk_file,
+            'Size (MB)': size_mb,
+            'Project File': matches[0] if matches else '',
+            'Saran Optimasi': saran
+        })
+    return mapping
+
+def safe_rmtree(path, retries=3):
+    for i in range(retries):
+        try:
+            shutil.rmtree(path)
+            return
+        except Exception as e:
+            print(f"Retrying delete {path} ({i+1}/{retries})... {e}")
+            time.sleep(1)
+    raise
+
+def analyze_apk_aab(apk_path, project_root=None):
+    import os
+    import pandas as pd
+    from tqdm import tqdm
+    extract_dir = apk_path + "_extract"
+    if os.path.exists(extract_dir):
+        safe_rmtree(extract_dir)
+    with zipfile.ZipFile(apk_path, 'r') as zip_ref:
+        zip_ref.extractall(extract_dir)
+    data = []
+    for root, dirs, files in os.walk(extract_dir):
+        for file in files:
+            file_path = os.path.join(root, file)
+            rel_path = os.path.relpath(file_path, extract_dir)
+            size_mb = round(os.path.getsize(file_path) / 1024 / 1024, 2)
+            saran = suggest_optimization(rel_path, size_mb)
+            data.append((rel_path, size_mb, saran))
+    df = pd.DataFrame([{'File in APK/AAB': d[0], 'Size (MB)': d[1], 'Saran Optimasi': d[2]} for d in data])
+    if not df.empty:
+        df = df.sort_values(["Size (MB)"], ascending=[False])
+    # Mapping ke project
+    mapping_df = None
+    if project_root:
+        mapping = map_apk_to_project(data, project_root)
+        mapping_df = pd.DataFrame(mapping)
+        if not mapping_df.empty:
+            mapping_df = mapping_df.sort_values(["Size (MB)"], ascending=[False])
+    return df, mapping_df
 
 if __name__ == '__main__':
     main()
